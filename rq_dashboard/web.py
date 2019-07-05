@@ -29,6 +29,7 @@ from redis.sentinel import Sentinel
 from rq import (Queue, Worker, cancel_job, pop_connection,
                 push_connection, requeue_job)
 from rq.job import Job
+from rq.registry import FinishedJobRegistry, StartedJobRegistry
 from .legacy_config import upgrade_config
 
 
@@ -59,6 +60,33 @@ def get_queue(queue_name):
         return get_failed_queue()
     else:
         return Queue(queue_name)
+
+
+def get_registry(queue, state):
+    params = dict(
+        name=queue.name,
+        connection=queue.connection,
+        job_class=queue.job_class
+    )
+
+    if state == 'finished':
+        registry_class = FinishedJobRegistry
+    elif state == 'running':
+        registry_class = StartedJobRegistry
+
+    return registry_class(**params)
+
+
+def get_all_job_ids(queue_name, state):
+    job_ids = []
+    queue = get_queue(queue_name)
+    if state:
+        registry = get_registry(queue, state)
+        if registry:
+            job_ids = registry.get_job_ids()
+    else:
+        job_ids = queue.get_job_ids()
+    return job_ids
 
 
 @blueprint.before_app_first_request
@@ -156,8 +184,9 @@ def pagination_window(total_items, cur_page, per_page=5, window_size=10):
 
 @blueprint.route('/', defaults={'queue_name': None, 'page': '1'})
 @blueprint.route('/<queue_name>', defaults={'page': '1'})
+@blueprint.route('/<queue_name>/<state>/<page>')
 @blueprint.route('/<queue_name>/<page>')
-def overview(queue_name, page):
+def overview(queue_name, page, state=None):
     if queue_name == 'failed':
         queue = get_failed_queue()
     elif queue_name is None:
@@ -169,11 +198,13 @@ def overview(queue_name, page):
             queue = Queue()
     else:
         queue = Queue(queue_name)
+
     r = make_response(render_template(
         'rq_dashboard/dashboard.html',
         workers=Worker.all(),
         queue=queue,
         page=page,
+        state=state,
         queues=get_all_queues(),
         rq_url_prefix=url_for('.overview'),
         newest_top=current_app.config.get('RQ_DASHBOARD_JOB_SORT_ORDER') == '-age'
@@ -192,10 +223,17 @@ def cancel_job_view(job_id):
     return dict(status='OK')
 
 
-@blueprint.route('/job/<job_id>/requeue', methods=['POST'])
+@blueprint.route('/job/<job_id>/<state>/requeue', methods=['POST'])
 @jsonify
-def requeue_job_view(job_id):
-    requeue_job(job_id, connection=current_app.redis_conn)
+def requeue_job_view(job_id, state=None):
+    print(job_id, state)
+    if not state:
+        requeue_job(job_id, connection=current_app.redis_conn)
+    elif state == 'finished':
+        job = Job.fetch(job_id)
+        queue = get_queue(job.origin)
+        print(queue, job)
+        queue.enqueue_job(job)
     return dict(status='OK')
 
 
@@ -215,6 +253,22 @@ def requeue_all():
 def empty_queue(queue_name):
     q = get_queue(queue_name)
     q.empty()
+    return dict(status='OK')
+
+
+@blueprint.route('/queue/<queue_name>/<state>/cancel_all_job', methods=['POST'])
+@jsonify
+def cancel_all_job_view(queue_name, state=None):
+    for job_id in get_all_job_ids(queue_name, state):
+        cancel_job(job_id)
+    return dict(status='OK')
+
+
+@blueprint.route('/queue/<queue_name>/<state>/delete_all_job', methods=['POST'])
+@jsonify
+def delete_all_job_view(queue_name, state=None):
+    for job_id in get_all_job_ids(queue_name, state):
+        Job.fetch(job_id).delete()
     return dict(status='OK')
 
 
@@ -264,17 +318,23 @@ def list_queues():
     return dict(queues=queues)
 
 
-@blueprint.route('/jobs/<queue_name>/<page>.json')
+@blueprint.route('/jobs/<queue_name>/<state>/<page>.json')
 @jsonify
-def list_jobs(queue_name, page):
+def list_jobs(queue_name, page, state='pending'):
     current_page = int(page)
     queue = get_queue(queue_name)
     per_page = 5
+
     total_items = queue.count
+    registry = None
+    if state in ['running', 'finished']:
+        registry = get_registry(queue, state)
+        total_items = registry.count if registry else 0
+
     pages_numbers_in_window = pagination_window(
         total_items, current_page, per_page)
     pages_in_window = [
-        dict(number=p, url=url_for('.overview', queue_name=queue_name, page=p))
+        dict(number=p, url=url_for('.overview', queue_name=queue_name, page=p, state=state))
         for p in pages_numbers_in_window
     ]
     last_page = int(ceil(total_items / float(per_page)))
@@ -282,15 +342,15 @@ def list_jobs(queue_name, page):
     prev_page = None
     if current_page > 1:
         prev_page = dict(url=url_for(
-            '.overview', queue_name=queue_name, page=(current_page - 1)))
+            '.overview', queue_name=queue_name, page=(current_page - 1), state=state))
 
     next_page = None
     if current_page < last_page:
         next_page = dict(url=url_for(
-            '.overview', queue_name=queue_name, page=(current_page + 1)))
+            '.overview', queue_name=queue_name, page=(current_page + 1), state=state))
 
-    first_page_link = dict(url=url_for('.overview', queue_name=queue_name, page=1))
-    last_page_link = dict(url=url_for('.overview', queue_name=queue_name, page=last_page))
+    first_page_link = dict(url=url_for('.overview', queue_name=queue_name, page=1, state=state))
+    last_page_link = dict(url=url_for('.overview', queue_name=queue_name, page=last_page, state=state))
 
     pagination = remove_none_values(
         dict(
@@ -311,12 +371,18 @@ def list_jobs(queue_name, page):
     else:
         offset = (current_page - 1) * per_page
 
-    queue_jobs = queue.get_jobs(offset, per_page)
+    if registry:
+        job_ids = registry.get_job_ids(offset, per_page)
+        queue_jobs = [queue.fetch_job(job_id) for job_id in job_ids]
+    elif total_items > 0:
+        queue_jobs = queue.get_jobs(offset, per_page)
+    else:
+        queue_jobs = []
 
     if reverse_order:
         queue_jobs = sorted(queue_jobs, key=lambda x: x.created_at, reverse=True)
 
-    jobs = [serialize_job(job) for job in queue_jobs]
+    jobs = [serialize_job(job) for job in queue_jobs if job]
     return dict(name=queue.name, jobs=jobs, pagination=pagination)
 
 
